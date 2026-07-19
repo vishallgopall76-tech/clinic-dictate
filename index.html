@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<!-- CLINIC RECORDS — Dictation Helper — v1.00
+     Standalone page hosted outside Apps Script's sandboxed iframe, where the browser's
+     microphone permission actually works. Opened in a new tab by the Clinic app, sends
+     the finished transcript back via postMessage, and does nothing else — no data is
+     stored, transmitted anywhere else, or sent to any AI here. -->
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>Dictation — Clinic Records</title>
+<style>
+  :root{
+    --ink:#1b2430; --muted:#6b7684; --line:#e3ddd0; --card:#fffdf8; --bg:#f4f1e9;
+    --wine:#7a2e2e; --accent:#2f4a63; --font-mono:'SF Mono',Menlo,monospace;
+  }
+  *{box-sizing:border-box;}
+  body{margin:0;background:var(--bg);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px;}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:18px;padding:26px 22px;max-width:460px;width:100%;box-shadow:0 8px 30px rgba(0,0,0,0.08);}
+  h1{font-size:19px;margin:0 0 4px;}
+  .label{font-family:var(--font-mono);font-size:11px;color:var(--muted);letter-spacing:0.05em;text-transform:uppercase;margin-bottom:18px;}
+  .mic-wrap{display:flex;justify-content:center;margin:20px 0;}
+  .mic-btn{width:88px;height:88px;border-radius:50%;border:2px solid var(--accent);background:var(--card);font-size:34px;display:flex;align-items:center;justify-content:center;}
+  .mic-btn.active{background:var(--wine);border-color:var(--wine);animation:pulse 1.3s ease-in-out infinite;}
+  @keyframes pulse{0%,100%{opacity:1;}50%{opacity:0.6;}}
+  .status{text-align:center;font-family:var(--font-mono);font-size:12px;color:var(--muted);margin-bottom:16px;min-height:16px;}
+  textarea{width:100%;min-height:160px;border:1px solid var(--line);border-radius:10px;padding:12px;font-size:15px;font-family:inherit;resize:vertical;background:#fff;}
+  .btn-row{display:flex;gap:10px;margin-top:16px;}
+  .btn{flex:1;padding:13px;border-radius:10px;border:none;font-size:15px;font-weight:600;}
+  .btn-primary{background:var(--accent);color:#fff;}
+  .btn-ghost{background:transparent;border:1.5px solid var(--line);color:var(--ink);}
+  .btn:disabled{opacity:0.4;}
+  .err{color:var(--wine);font-size:13px;text-align:center;margin-top:10px;}
+  .sent-banner{text-align:center;color:#2a7a4f;font-weight:600;margin-top:14px;}
+</style>
+</head>
+<body>
+  <div class="card">
+    <h1 id="title">Dictation</h1>
+    <div class="label" id="subtitle">Loading…</div>
+
+    <div class="mic-wrap"><button class="mic-btn" id="micBtn">&#127908;</button></div>
+    <div class="status" id="status">Tap the mic to start</div>
+
+    <textarea id="transcript" placeholder="Your dictated text will appear here — you can edit it before sending."></textarea>
+
+    <div class="btn-row">
+      <button class="btn btn-ghost" id="cancelBtn">Cancel</button>
+      <button class="btn btn-primary" id="sendBtn" disabled>Send to app</button>
+    </div>
+    <div id="err" class="err"></div>
+    <div id="sentBanner" class="sent-banner" style="display:none;">Sent — you can close this tab.</div>
+  </div>
+
+<script>
+const params = new URLSearchParams(location.search);
+const originParam = params.get('origin');   // the Clinic app's origin — postMessage target
+const mode = params.get('mode') || 'field'; // 'field' (long dictation) or 'command' (single utterance)
+const field = params.get('field') || '';
+const label = params.get('label') || (mode === 'command' ? 'Voice command' : 'Dictation');
+
+document.getElementById('title').textContent = mode === 'command' ? 'Talk to the app' : 'Dictate';
+document.getElementById('subtitle').textContent = label;
+
+const errEl = document.getElementById('err');
+if(!originParam){
+  errEl.textContent = "This page must be opened from the Clinic app — nothing to send this to.";
+}
+
+const micBtn = document.getElementById('micBtn');
+const statusEl = document.getElementById('status');
+const ta = document.getElementById('transcript');
+const sendBtn = document.getElementById('sendBtn');
+const cancelBtn = document.getElementById('cancelBtn');
+
+let recognition = null;
+let silenceTimer = null, hardTimer = null;
+let startedAt = 0;
+
+function onVisibilityChange(){
+  if(document.hidden && recognition && (Date.now() - startedAt) >= 2000){
+    try{ recognition.stop(); }catch(e){}
+  }
+}
+
+function startListening(){
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if(!SR){ errEl.textContent = "Speech recognition isn't supported in this browser."; return; }
+  if(recognition){ recognition.stop(); return; }
+
+  const rec = new SR();
+  rec.lang = 'en-GB';
+  rec.continuous = (mode !== 'command');
+  rec.interimResults = true;
+  rec.maxAlternatives = 1;
+
+  const baseText = ta.value ? ta.value.replace(/\s+$/,'') + ' ' : '';
+  let finalTranscript = '';
+
+  function resetSilence(){
+    clearTimeout(silenceTimer);
+    const gap = mode === 'command' ? 8000 : 90000; // command: short single-shot; field: loose backstop
+    silenceTimer = setTimeout(()=>{ try{ rec.stop(); }catch(e){} }, gap);
+  }
+
+  rec.onstart = ()=>{
+    recognition = rec;
+    startedAt = Date.now();
+    micBtn.classList.add('active');
+    statusEl.textContent = 'Listening…';
+    resetSilence();
+    clearTimeout(hardTimer);
+    const ceiling = mode === 'command' ? 20000 : 300000; // command: 20s outer bound; field: 5 min
+    hardTimer = setTimeout(()=>{ try{ rec.stop(); }catch(e){} }, ceiling);
+    document.addEventListener('visibilitychange', onVisibilityChange);
+  };
+  rec.onresult = (e)=>{
+    resetSilence();
+    let interim = '';
+    for(let i=e.resultIndex;i<e.results.length;i++){
+      const t = e.results[i][0].transcript;
+      if(e.results[i].isFinal) finalTranscript += t + ' ';
+      else interim += t;
+    }
+    ta.value = (baseText + finalTranscript + interim).trim();
+    sendBtn.disabled = !ta.value.trim();
+  };
+  rec.onerror = (e)=>{
+    if(e.error === 'not-allowed'){
+      errEl.textContent = "Microphone permission was denied for this page. Check your browser's site settings.";
+    } else if(e.error !== 'no-speech' && e.error !== 'aborted'){
+      errEl.textContent = "Dictation error: " + e.error;
+    }
+  };
+  rec.onend = ()=>{
+    clearTimeout(silenceTimer);
+    clearTimeout(hardTimer);
+    document.removeEventListener('visibilitychange', onVisibilityChange);
+    micBtn.classList.remove('active');
+    statusEl.textContent = ta.value.trim() ? 'Stopped — review and send' : 'Tap the mic to start';
+    recognition = null;
+  };
+  rec.start();
+}
+
+micBtn.onclick = startListening;
+ta.addEventListener('input', ()=>{ sendBtn.disabled = !ta.value.trim(); });
+
+sendBtn.onclick = ()=>{
+  if(!originParam || !window.opener){ errEl.textContent = "Can't reach the Clinic app tab — go back and try again."; return; }
+  if(recognition){ try{ recognition.stop(); }catch(e){} }
+  window.opener.postMessage({
+    source: 'clinicDictationHelper',
+    mode: mode,
+    field: field,
+    text: ta.value.trim()
+  }, originParam);
+  document.getElementById('sentBanner').style.display = 'block';
+  sendBtn.disabled = true;
+  micBtn.disabled = true;
+  setTimeout(()=>{ try{ window.close(); }catch(e){} }, 900);
+};
+
+cancelBtn.onclick = ()=>{
+  if(recognition){ try{ recognition.stop(); }catch(e){} }
+  try{ window.close(); }catch(e){}
+};
+</script>
+</body>
+</html>
