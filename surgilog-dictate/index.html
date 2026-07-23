@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>SurgiLog Dictation</title>
+<style>
+  :root { --navy:#1c2b4a; --ink:#1c2230; --grey:#6b7280; --border:#e3e6ee; --blue:#e8f0fe; --blue-t:#1a56db; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; background:#f5f6fa; color:var(--ink); min-height:100vh; display:flex; flex-direction:column; align-items:center; padding:24px 16px 40px; }
+  h1 { font-size:17px; font-weight:700; color:var(--navy); margin:8px 0 2px; }
+  .sub { font-size:12.5px; color:var(--grey); margin-bottom:22px; text-align:center; max-width:340px; }
+  .mic-circle { width:96px; height:96px; border-radius:50%; background:var(--blue); display:flex; align-items:center; justify-content:center; font-size:38px; border:none; cursor:pointer; transition:transform .15s, background .2s; }
+  .mic-circle.live { background:#fdecea; animation:pulse 1.4s infinite; }
+  @keyframes pulse { 0%{box-shadow:0 0 0 0 rgba(179,38,30,.35);} 70%{box-shadow:0 0 0 18px rgba(179,38,30,0);} 100%{box-shadow:0 0 0 0 rgba(179,38,30,0);} }
+  .status { margin-top:14px; font-size:13px; font-weight:600; color:var(--grey); }
+  textarea { width:100%; max-width:420px; margin-top:20px; min-height:160px; border:1px solid var(--border); border-radius:12px; padding:14px; font-size:15px; line-height:1.5; color:var(--ink); resize:vertical; }
+  .actions { width:100%; max-width:420px; display:flex; gap:10px; margin-top:14px; }
+  button.action { flex:1; padding:13px; border-radius:10px; border:none; font-weight:600; font-size:14.5px; cursor:pointer; }
+  .send { background:var(--navy); color:#fff; }
+  .clear { background:#eef1f7; color:#445; }
+  .send:disabled { opacity:.4; }
+  .err { color:#b3261e; font-size:12.5px; margin-top:10px; text-align:center; max-width:340px; }
+  .note { margin-top:26px; font-size:11px; color:#9aa; text-align:center; max-width:340px; }
+</style>
+</head>
+<body>
+  <h1>🎙 SurgiLog Dictation</h1>
+  <div class="sub">This page just does speech-to-text — nothing is saved here or sent anywhere except back to SurgiLog when you tap Send.</div>
+  <button class="mic-circle" id="micBtn">🎤</button>
+  <div class="status" id="statusEl">Tap the mic to start</div>
+  <textarea id="transcript" placeholder="Your words will appear here…"></textarea>
+  <div class="actions">
+    <button class="action clear" id="clearBtn">Clear</button>
+    <button class="action send" id="sendBtn" disabled>Send to app</button>
+  </div>
+  <div class="err" id="errEl"></div>
+  <div class="note">You can close this tab any time — closing it without sending just cancels the dictation.</div>
+
+<script>
+var params = new URLSearchParams(location.search);
+var openerOrigin = params.get('origin') || '*';
+
+var micBtn = document.getElementById('micBtn');
+var statusEl = document.getElementById('statusEl');
+var ta = document.getElementById('transcript');
+var sendBtn = document.getElementById('sendBtn');
+var clearBtn = document.getElementById('clearBtn');
+var errEl = document.getElementById('errEl');
+
+var SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+var rec = null;
+var listening = false;
+var finalText = '';
+
+if (!SR) {
+  statusEl.textContent = 'Not supported in this browser';
+  errEl.textContent = 'Try Safari or Chrome on your phone instead.';
+  micBtn.disabled = true;
+} else {
+  rec = new SR();
+  rec.lang = 'en-GB';
+  rec.continuous = true;
+  rec.interimResults = true;
+
+  rec.onresult = function(ev) {
+    var interim = '';
+    for (var i = ev.resultIndex; i < ev.results.length; i++) {
+      var t = ev.results[i][0].transcript;
+      if (ev.results[i].isFinal) finalText += t + ' ';
+      else interim += t;
+    }
+    ta.value = (finalText + interim).trim();
+    sendBtn.disabled = !ta.value.trim();
+  };
+  rec.onerror = function(ev) {
+    if (ev.error === 'no-speech') return; // not fatal, recognition keeps listening
+    errEl.textContent = 'Mic error: ' + ev.error + '. Check this page has microphone permission.';
+    stopListening();
+  };
+  rec.onend = function() {
+    if (listening) { try { rec.start(); } catch(e) { stopListening(); } } // auto-restart, browsers time out ~60s
+  };
+}
+
+function startListening() {
+  if (!rec) return;
+  errEl.textContent = '';
+  listening = true;
+  try { rec.start(); } catch(e) {}
+  micBtn.classList.add('live');
+  micBtn.textContent = '⏹';
+  statusEl.textContent = 'Listening… tap to stop';
+}
+function stopListening() {
+  listening = false;
+  if (rec) { try { rec.stop(); } catch(e) {} }
+  micBtn.classList.remove('live');
+  micBtn.textContent = '🎤';
+  statusEl.textContent = ta.value.trim() ? 'Stopped — edit below if needed' : 'Tap the mic to start';
+}
+
+micBtn.addEventListener('click', function() {
+  if (listening) stopListening(); else startListening();
+});
+ta.addEventListener('input', function() {
+  finalText = ta.value.trim() ? ta.value.trim() + ' ' : '';
+  sendBtn.disabled = !ta.value.trim();
+});
+clearBtn.addEventListener('click', function() {
+  finalText = '';
+  ta.value = '';
+  sendBtn.disabled = true;
+});
+sendBtn.addEventListener('click', function() {
+  var text = ta.value.trim();
+  if (!text || !window.opener) return;
+  try {
+    window.opener.postMessage({ source: 'surgilog_dictation', text: text }, openerOrigin === '*' ? '*' : openerOrigin);
+  } catch (e) {
+    try { window.opener.postMessage({ source: 'surgilog_dictation', text: text }, '*'); } catch(e2) {}
+  }
+  statusEl.textContent = 'Sent ✓ — you can close this tab';
+  sendBtn.disabled = true;
+  micBtn.disabled = true;
+  if (listening) stopListening();
+});
+
+// If the microphone permission is denied outright, SpeechRecognition surfaces it as an 'error'
+// event with error === 'not-allowed' on first start — the message above already covers this case,
+// but worth noting explicitly: this only happens if the person denies the browser's own permission
+// prompt on THIS page, which is a normal top-level page (unlike the Apps Script iframe) so the
+// prompt actually appears and normal Allow/Block choices work as expected.
+</script>
+</body>
+</html>
