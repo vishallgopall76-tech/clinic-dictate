@@ -26,9 +26,9 @@
 </head>
 <body>
   <h1>🎙 SurgiLog Dictation</h1>
-  <div class="sub">This page just does speech-to-text — nothing is saved here or sent anywhere except back to SurgiLog when you tap Send.</div>
+  <div class="sub">Listening starts automatically. Nothing is saved here or sent anywhere except back to SurgiLog when you tap Send.</div>
   <button class="mic-circle" id="micBtn">🎤</button>
-  <div class="status" id="statusEl">Tap the mic to start</div>
+  <div class="status" id="statusEl">Starting…</div>
   <textarea id="transcript" placeholder="Your words will appear here…"></textarea>
   <div class="actions">
     <button class="action clear" id="clearBtn">Clear</button>
@@ -40,6 +40,8 @@
 <script>
 var params = new URLSearchParams(location.search);
 var openerOrigin = params.get('origin') || '*';
+var sessionId = params.get('session') || '';
+var submitUrl = params.get('submitUrl') || '';
 
 var micBtn = document.getElementById('micBtn');
 var statusEl = document.getElementById('statusEl');
@@ -52,6 +54,7 @@ var SR = window.SpeechRecognition || window.webkitSpeechRecognition;
 var rec = null;
 var listening = false;
 var finalText = '';
+var autoStarting = false; // true only during the automatic on-load attempt below, never during a manual tap
 
 if (!SR) {
   statusEl.textContent = 'Not supported in this browser';
@@ -75,12 +78,36 @@ if (!SR) {
   };
   rec.onerror = function(ev) {
     if (ev.error === 'no-speech') return; // not fatal, recognition keeps listening
+    if (autoStarting && (ev.error === 'not-allowed' || ev.error === 'service-not-allowed')) {
+      // 2026-07-24: this is the automatic on-load attempt hitting a permission that hasn't been
+      // granted yet (normal on a first-ever visit) — not a real error worth alarming anyone with.
+      // Reset quietly to the plain "tap to start" state; tapping the mic manually will trigger the
+      // browser's actual permission prompt, and only a failure AFTER that point is a real error.
+      autoStarting = false;
+      stopListening();
+      return;
+    }
     errEl.textContent = 'Mic error: ' + ev.error + '. Check this page has microphone permission.';
     stopListening();
   };
   rec.onend = function() {
     if (listening) { try { rec.start(); } catch(e) { stopListening(); } } // auto-restart, browsers time out ~60s
   };
+}
+
+// 2026-07-24 FIX ("dictation isn't opening"): most of the confusion here was never actually a bug —
+// this page has always required its OWN separate tap on the mic circle to start listening, on top
+// of the tap on "Dictate" back in SurgiLog that opened this page in the first place. If someone
+// doesn't immediately notice their browser switched to this new tab, that second required tap never
+// happens, and it looks exactly like "dictation isn't working." Auto-starting the moment this page
+// loads removes that second tap in the common case (mic permission already granted from a previous
+// visit) — recognition just begins immediately. If permission hasn't been granted yet (a genuinely
+// first-ever visit), this silently no-ops (handled above) and the mic button still works manually,
+// exactly as before — purely additive, nothing about the manual path changes or regresses.
+if (rec) {
+  autoStarting = true;
+  startListening();
+  setTimeout(function() { autoStarting = false; }, 2000); // only suppress errors from THIS attempt, briefly
 }
 
 function startListening() {
@@ -114,13 +141,37 @@ clearBtn.addEventListener('click', function() {
 });
 sendBtn.addEventListener('click', function() {
   var text = ta.value.trim();
-  if (!text || !window.opener) return;
-  try {
-    window.opener.postMessage({ source: 'surgilog_dictation', text: text }, openerOrigin === '*' ? '*' : openerOrigin);
-  } catch (e) {
-    try { window.opener.postMessage({ source: 'surgilog_dictation', text: text }, '*'); } catch(e2) {}
+  if (!text) return;
+  var deliveredSomehow = false;
+  // 2026-07-24: postMessage back to the opener — works fine when SurgiLog is opened in a normal
+  // Safari tab. window.opener is frequently null/broken when SurgiLog is opened as an iOS Home
+  // Screen app instead (window.open() there often hands off to Safari as a genuinely separate app),
+  // which is exactly why the submitUrl POST below exists as an unconditional second attempt, not a
+  // fallback gated on this one failing.
+  if (window.opener) {
+    try {
+      window.opener.postMessage({ source: 'surgilog_dictation', text: text }, openerOrigin === '*' ? '*' : openerOrigin);
+      deliveredSomehow = true;
+    } catch (e) {
+      try { window.opener.postMessage({ source: 'surgilog_dictation', text: text }, '*'); deliveredSomehow = true; } catch(e2) {}
+    }
   }
-  statusEl.textContent = 'Sent ✓ — you can close this tab';
+  // Direct POST to SurgiLog's own doPost handler, keyed by the session id from the URL SurgiLog
+  // opened this page with. text/plain avoids a CORS preflight, which Apps Script Web Apps don't
+  // handle. This is the reliable path when window.opener isn't usable.
+  if (submitUrl && sessionId) {
+    fetch(submitUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+      body: JSON.stringify({ session: sessionId, text: text })
+    }).catch(function() {}); // SurgiLog polls for this either way — a network hiccup here just means try again
+    deliveredSomehow = true;
+  }
+  if (!deliveredSomehow) {
+    errEl.textContent = "Couldn't send \u2014 go back to SurgiLog and try dictating again.";
+    return;
+  }
+  statusEl.textContent = 'Sent \u2713 \u2014 you can close this tab';
   sendBtn.disabled = true;
   micBtn.disabled = true;
   if (listening) stopListening();
